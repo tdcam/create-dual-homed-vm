@@ -1,0 +1,339 @@
+---
+# create_vm.yml
+#
+# Create a KVM guest on one of the RHEL 10 hypervisors from a RAW golden image.
+#
+# Survey variables:
+#   hypervisor   - armitage | dixie-flatline | hideo | lady3jane | molly | neuromancer | riviera
+#                  (short name or FQDN, must match the AAP inventory hostname)
+#   vmhostname   - DNS short hostname of the new VM          e.g. "wintermute"
+#   vmdomain     - DNS domain of the new VM                  e.g. "aus.redhat.com"
+#   public_mac   - MAC for the NIC on bridge0 (optional)     e.g. "52:54:00:aa:bb:01"
+#   private_mac  - MAC for the NIC on bridge1 (optional)     e.g. "52:54:00:aa:bb:02"
+#   target_os    - rhel9.8 | rhel9.9 | rhel10.2 | rhel10.3   ("RHEL 9.8" style also accepted)
+#
+# Optional variables (sane defaults, can be added to the survey if wanted):
+#   vm_vcpus (2), vm_memory_mb (4096), vm_firmware (bios|efi, default bios),
+#   vnc_listen (0.0.0.0)
+#
+# Requirements on the hypervisors: python3-libvirt, python3-lxml (installed by this playbook)
+# Requirements in the execution environment: community.libvirt collection
+
+########################################################################
+# Play 1: validate survey input on the controller before touching hosts
+########################################################################
+- name: Validate VM request
+  hosts: localhost
+  gather_facts: false
+  vars:
+    allowed_hypervisors:
+      - armitage.aus.redhat.com
+      - dixie-flatline.aus.redhat.com
+      - hideo.aus.redhat.com
+      - lady3jane.aus.redhat.com
+      - molly.aus.redhat.com
+      - neuromancer.aus.redhat.com
+      - riviera.aus.redhat.com
+    allowed_os:
+      - rhel9.8
+      - rhel9.9
+      - rhel10.2
+      - rhel10.3
+    mac_regex: '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+
+  tasks:
+    - name: Normalise survey input
+      ansible.builtin.set_fact:
+        req_hypervisor: "{{ (hypervisor | default('') | trim | lower) }}"
+        req_vmhostname: "{{ vmhostname | default('') | trim | lower }}"
+        req_vmdomain: "{{ vmdomain | default('') | trim | lower | regex_replace('^\\.|\\.$', '') }}"
+        req_public_mac: "{{ public_mac | default('', true) | trim | lower | replace('-', ':') }}"
+        req_private_mac: "{{ private_mac | default('', true) | trim | lower | replace('-', ':') }}"
+        req_target_os: "{{ target_os | default('') | trim | lower | replace(' ', '') }}"
+
+    - name: Resolve hypervisor short name to FQDN if needed
+      ansible.builtin.set_fact:
+        req_hypervisor: >-
+          {{ (allowed_hypervisors | select('match', '^' ~ (req_hypervisor | regex_escape) ~ '(\.|$)') | list | first)
+             | default(req_hypervisor) }}
+
+    - name: Validate hypervisor
+      ansible.builtin.assert:
+        that:
+          - req_hypervisor in allowed_hypervisors
+          - req_hypervisor in groups['all']
+        fail_msg: >-
+          Hypervisor '{{ hypervisor | default('') }}' is not valid or not in the inventory.
+          Valid choices: {{ allowed_hypervisors | join(', ') }}
+
+    - name: Validate hostname and domain
+      ansible.builtin.assert:
+        that:
+          - req_vmhostname is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+          - req_vmdomain is match('^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
+        fail_msg: "Invalid vmhostname '{{ vmhostname | default('') }}' or vmdomain '{{ vmdomain | default('') }}'."
+
+    - name: Validate target OS
+      ansible.builtin.assert:
+        that: req_target_os in allowed_os
+        fail_msg: "target_os '{{ target_os | default('') }}' is not one of: {{ allowed_os | join(', ') }}"
+
+    - name: Ensure at least one MAC address was supplied
+      ansible.builtin.assert:
+        that: (req_public_mac | length > 0) or (req_private_mac | length > 0)
+        fail_msg: "You must supply public_mac, private_mac, or both."
+
+    - name: Validate public MAC address
+      ansible.builtin.assert:
+        that:
+          - req_public_mac is match(mac_regex)
+          - (req_public_mac[1] | int(base=16)) % 2 == 0   # must be unicast
+        fail_msg: "public_mac '{{ public_mac }}' is not a valid unicast MAC address."
+      when: req_public_mac | length > 0
+
+    - name: Validate private MAC address
+      ansible.builtin.assert:
+        that:
+          - req_private_mac is match(mac_regex)
+          - (req_private_mac[1] | int(base=16)) % 2 == 0   # must be unicast
+        fail_msg: "private_mac '{{ private_mac }}' is not a valid unicast MAC address."
+      when: req_private_mac | length > 0
+
+    - name: Ensure the two MAC addresses differ
+      ansible.builtin.assert:
+        that: req_public_mac != req_private_mac
+        fail_msg: "public_mac and private_mac must be different."
+      when:
+        - req_public_mac | length > 0
+        - req_private_mac | length > 0
+
+    - name: Add the selected hypervisor to the target group
+      ansible.builtin.add_host:
+        name: "{{ req_hypervisor }}"
+        groups: vm_target
+
+########################################################################
+# Play 2: build the VM on the selected hypervisor
+########################################################################
+- name: Create VM on the selected hypervisor
+  hosts: vm_target
+  gather_facts: false
+  become: true
+
+  vars:
+    req: "{{ hostvars['localhost'] }}"
+    vm_fqdn: "{{ req.req_vmhostname }}.{{ req.req_vmdomain }}"
+    vm_name: "{{ vm_fqdn }}"
+    vm_os: "{{ req.req_target_os }}"
+    vm_public_mac: "{{ req.req_public_mac }}"
+    vm_private_mac: "{{ req.req_private_mac }}"
+
+    golden_image: "/var/lib/libvirt/images/pool/{{ vm_os }}.img"
+    vm_disk: "/var/lib/libvirt/images/{{ vm_fqdn }}.img"
+
+    vm_vcpus: 2
+    vm_memory_mb: 4096
+    vm_firmware: bios          # set to 'efi' if your golden images are UEFI-only
+    vnc_listen: "0.0.0.0"
+
+    # libosinfo IDs, e.g. rhel9.8 -> http://redhat.com/rhel/9.8
+    osinfo_id: "http://redhat.com/rhel/{{ vm_os | regex_replace('^rhel', '') }}"
+
+    vm_xml: |
+      <domain type='kvm'>
+        <name>{{ vm_name }}</name>
+        <title>{{ vm_fqdn }} ({{ vm_os }})</title>
+        <metadata>
+          <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+            <libosinfo:os id="{{ osinfo_id }}"/>
+          </libosinfo:libosinfo>
+        </metadata>
+        <memory unit='MiB'>{{ vm_memory_mb }}</memory>
+        <currentMemory unit='MiB'>{{ vm_memory_mb }}</currentMemory>
+        <vcpu placement='static'>{{ vm_vcpus }}</vcpu>
+        <os{% if vm_firmware == 'efi' %} firmware='efi'{% endif %}>
+          <type arch='x86_64' machine='q35'>hvm</type>
+          <boot dev='hd'/>
+        </os>
+        <features>
+          <acpi/>
+          <apic/>
+        </features>
+        <!-- host-model keeps the guest migratable between hypervisors -->
+        <cpu mode='host-model' check='partial'/>
+        <clock offset='utc'>
+          <timer name='rtc' tickpolicy='catchup'/>
+          <timer name='pit' tickpolicy='delay'/>
+          <timer name='hpet' present='no'/>
+        </clock>
+        <on_poweroff>destroy</on_poweroff>
+        <on_reboot>restart</on_reboot>
+        <on_crash>destroy</on_crash>
+        <pm>
+          <suspend-to-mem enabled='no'/>
+          <suspend-to-disk enabled='no'/>
+        </pm>
+        <devices>
+          <emulator>/usr/libexec/qemu-kvm</emulator>
+          <disk type='file' device='disk'>
+            <driver name='qemu' type='raw' cache='none' io='native' discard='unmap'/>
+            <source file='{{ vm_disk }}'/>
+            <target dev='vda' bus='virtio'/>
+            <shareable/>
+          </disk>
+      {% if vm_public_mac | length > 0 %}
+          <interface type='bridge'>
+            <mac address='{{ vm_public_mac }}'/>
+            <source bridge='bridge0'/>
+            <model type='virtio'/>
+          </interface>
+      {% endif %}
+      {% if vm_private_mac | length > 0 %}
+          <interface type='bridge'>
+            <mac address='{{ vm_private_mac }}'/>
+            <source bridge='bridge1'/>
+            <model type='virtio'/>
+          </interface>
+      {% endif %}
+          <serial type='pty'>
+            <target type='isa-serial' port='0'/>
+          </serial>
+          <console type='pty'>
+            <target type='serial' port='0'/>
+          </console>
+          <channel type='unix'>
+            <target type='virtio' name='org.qemu.guest_agent.0'/>
+          </channel>
+          <input type='tablet' bus='usb'/>
+          <graphics type='vnc' port='-1' autoport='yes' listen='{{ vnc_listen }}'>
+            <listen type='address' address='{{ vnc_listen }}'/>
+          </graphics>
+          <video>
+            <model type='virtio' heads='1' primary='yes'/>
+          </video>
+          <memballoon model='virtio'/>
+          <rng model='virtio'>
+            <backend model='random'>/dev/urandom</backend>
+          </rng>
+        </devices>
+      </domain>
+
+  tasks:
+    - name: Ensure libvirt Python bindings are present
+      ansible.builtin.dnf:
+        name:
+          - python3-libvirt
+          - python3-lxml
+        state: present
+
+    - name: Check that the golden image exists
+      ansible.builtin.stat:
+        path: "{{ golden_image }}"
+        get_checksum: false
+      register: golden_stat
+
+    - name: Fail if the golden image is missing
+      ansible.builtin.fail:
+        msg: "Golden image {{ golden_image }} does not exist on {{ inventory_hostname }}."
+      when: not golden_stat.stat.exists
+
+    - name: Check whether the VM disk image already exists
+      ansible.builtin.stat:
+        path: "{{ vm_disk }}"
+        get_checksum: false
+      register: vm_disk_stat
+
+    - name: Fail if the VM disk image already exists
+      ansible.builtin.fail:
+        msg: >-
+          ERROR: {{ vm_disk }} already exists. Refusing to overwrite it.
+          Choose a different hostname/domain or remove the existing VM first.
+      when: vm_disk_stat.stat.exists
+
+    - name: List VMs already defined on this hypervisor
+      community.libvirt.virt:
+        command: list_vms
+        uri: qemu:///system
+      register: existing_vms
+
+    - name: Fail if a VM with this name is already defined
+      ansible.builtin.fail:
+        msg: "ERROR: a VM named {{ vm_name }} is already defined on {{ inventory_hostname }}."
+      when: vm_name in existing_vms.list_vms
+
+    - name: Build the VM
+      block:
+        - name: Copy golden image with system cp (sparse/reflink aware, much faster than copy module)
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/cp
+              - --reflink=auto
+              - --sparse=auto
+              - "{{ golden_image }}"
+              - "{{ vm_disk }}"
+            creates: "{{ vm_disk }}"
+          register: disk_copy
+
+        - name: Set ownership and permissions on the VM disk image
+          ansible.builtin.file:
+            path: "{{ vm_disk }}"
+            owner: qemu
+            group: qemu
+            mode: "0600"
+
+        - name: Ensure golden image is owned qemu:qemu with 0600
+          ansible.builtin.file:
+            path: "{{ golden_image }}"
+            owner: qemu
+            group: qemu
+            mode: "0600"
+
+        - name: Define the VM
+          community.libvirt.virt:
+            command: define
+            xml: "{{ vm_xml }}"
+            uri: qemu:///system
+
+        - name: Enable autostart and start the VM
+          community.libvirt.virt:
+            name: "{{ vm_name }}"
+            state: running
+            autostart: true
+            uri: qemu:///system
+
+      rescue:
+        - name: Remove partially created VM definition
+          community.libvirt.virt:
+            name: "{{ vm_name }}"
+            command: undefine
+            uri: qemu:///system
+          failed_when: false
+
+        - name: Remove disk image created by this run
+          ansible.builtin.file:
+            path: "{{ vm_disk }}"
+            state: absent
+          when: disk_copy is defined and disk_copy is changed
+
+        - name: Report failure
+          ansible.builtin.fail:
+            msg: "VM creation for {{ vm_name }} failed and was rolled back. See the errors above."
+
+    - name: Get VNC display
+      ansible.builtin.command:
+        argv: [virsh, -c, "qemu:///system", vncdisplay, "{{ vm_name }}"]
+      register: vnc_display
+      changed_when: false
+      failed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "VM:          {{ vm_name }}"
+          - "Hypervisor:  {{ inventory_hostname }}"
+          - "OS:          {{ vm_os }}"
+          - "Disk:        {{ vm_disk }} (raw, virtio, shareable, cache=none)"
+          - "bridge0 NIC: {{ vm_public_mac if vm_public_mac | length > 0 else 'none' }}"
+          - "bridge1 NIC: {{ vm_private_mac if vm_private_mac | length > 0 else 'none' }}"
+          - "VNC:         {{ inventory_hostname }}{{ vnc_display.stdout | default('') | trim }}"
+          - "Autostart:   enabled"
