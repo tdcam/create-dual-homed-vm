@@ -134,7 +134,7 @@
     vm_vcpus: 2
     vm_memory_mb: 4096
     vm_firmware: bios          # set to 'efi' if your golden images are UEFI-only
-    vnc_listen: "0.0.0.0"
+    vnc_listen: "127.0.0.1"
 
     # libosinfo IDs, e.g. rhel9.8 -> http://redhat.com/rhel/9.8
     osinfo_id: "http://redhat.com/rhel/{{ vm_os | regex_replace('^rhel', '') }}"
